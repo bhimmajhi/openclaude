@@ -1,0 +1,340 @@
+#!/usr/bin/env node
+
+/**
+ * OpenClaude — Claude Code with any LLM
+ *
+ * If dist/cli.mjs exists (built), run that.
+ * Otherwise, tell the user to build first or use `bun run dev`.
+ */
+
+import { existsSync } from 'fs'
+import { join, dirname } from 'path'
+import { fileURLToPath, pathToFileURL } from 'url'
+import { spawnSync } from 'child_process'
+import os from 'node:os'
+import * as nodeModule from 'node:module'
+
+// Sibling helpers (./node-compile-cache.mjs, ./heap-limit.mjs) ship inside
+// bin/ for npm installs, but non-npm layouts (e.g. distro packages that copy
+// only the launcher file to /usr/lib/openclaude/bin/) may omit them. A static
+// import would then fail with ERR_MODULE_NOT_FOUND before any code runs
+// (issue #2255). Load them dynamically so a missing sibling degrades to a
+// safe inline fallback instead of a hard boot crash. The fallbacks below are
+// intentionally self-contained; keep them in sync with the canonical helpers
+// in bin/node-compile-cache.mjs and bin/heap-limit.mjs.
+const FALLBACK_DEFAULT_HEAP_SIZE_MB = 8192
+const FALLBACK_HEAP_SIZE_ENV = 'OPENCLAUDE_NODE_MAX_OLD_SPACE_SIZE_MB'
+const FALLBACK_HEAP_PERCENTAGE_ENV =
+  'OPENCLAUDE_NODE_MAX_OLD_SPACE_SIZE_PERCENTAGE'
+const FALLBACK_HEAP_SIZE_FLAG = '--max-old-space-size'
+const FALLBACK_HEAP_PERCENTAGE_FLAG = '--max-old-space-size-percentage'
+const FALLBACK_MAX_MEMORY_FLAG = '--max-memory'
+
+function fallbackHasNodeFlag(args, flag) {
+  return args.some(arg => arg === flag || arg.startsWith(`${flag}=`))
+}
+
+function fallbackNodeOptionArgs(nodeOptions) {
+  return (nodeOptions || '').split(/\s+/).filter(Boolean)
+}
+
+function fallbackHasHeapLimitFlag(args) {
+  return (
+    fallbackHasNodeFlag(args, FALLBACK_HEAP_SIZE_FLAG) ||
+    fallbackHasNodeFlag(args, FALLBACK_HEAP_PERCENTAGE_FLAG)
+  )
+}
+
+function fallbackParsePositiveIntegerMb(raw) {
+  if (raw == null || raw === '') return null
+  const parsed = Number.parseInt(String(raw), 10)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+function fallbackParsePercentage(raw) {
+  if (raw == null) return null
+  const trimmed = String(raw).trim()
+  if (!trimmed) return null
+  const withoutPercent = trimmed.endsWith('%')
+    ? trimmed.slice(0, -1)
+    : trimmed
+  if (withoutPercent.trim() === '') return null
+  const parsed = Number(withoutPercent)
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) return null
+  return parsed
+}
+
+function fallbackGetAvailableMemoryBytes() {
+  try {
+    const constrained =
+      typeof process.constrainedMemory === 'function'
+        ? process.constrainedMemory()
+        : undefined
+    if (
+      typeof constrained === 'number' &&
+      Number.isSafeInteger(constrained) &&
+      constrained > 0
+    ) {
+      return constrained
+    }
+  } catch {
+    // Fall through to host total memory.
+  }
+  try {
+    const total = os.totalmem()
+    if (typeof total === 'number' && Number.isFinite(total) && total > 0) {
+      return total
+    }
+  } catch {
+    // Memory size unknown; callers fall back to the default heap.
+  }
+  return 0
+}
+
+function fallbackFindEqualsFlagValue(args, flag) {
+  const prefix = `${flag}=`
+  for (const arg of args) {
+    if (arg.startsWith(prefix)) return arg.slice(prefix.length)
+  }
+  return null
+}
+
+function fallbackFindEqualsOrNextFlagValue(args, flag) {
+  const prefix = `${flag}=`
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg.startsWith(prefix)) return arg.slice(prefix.length)
+    if (arg === flag) {
+      const next = args[i + 1]
+      if (next && !next.startsWith('-')) return next
+      return ''
+    }
+  }
+  return null
+}
+
+function fallbackStripLauncherHeapArgs(args) {
+  const stripped = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (
+      arg === FALLBACK_MAX_MEMORY_FLAG ||
+      arg.startsWith(`${FALLBACK_MAX_MEMORY_FLAG}=`)
+    )
+      continue
+    if (arg.startsWith(`${FALLBACK_HEAP_PERCENTAGE_FLAG}=`)) continue
+    if (arg === FALLBACK_HEAP_PERCENTAGE_FLAG) {
+      const next = args[i + 1]
+      if (next && !next.startsWith('-') && fallbackParsePercentage(next) != null)
+        i += 1
+      continue
+    }
+    stripped.push(arg)
+  }
+  return stripped
+}
+
+function fallbackResolveHeapSizeMb({ argv = [], env = {} } = {}) {
+  const availableBytes = fallbackGetAvailableMemoryBytes()
+  const maxMem = fallbackParsePositiveIntegerMb(
+    fallbackFindEqualsFlagValue(argv, FALLBACK_MAX_MEMORY_FLAG),
+  )
+  if (maxMem != null) {
+    return { mb: maxMem, source: 'max-memory', setMaxMemoryEnv: true }
+  }
+  const argvPercentage = fallbackParsePercentage(
+    fallbackFindEqualsOrNextFlagValue(argv, FALLBACK_HEAP_PERCENTAGE_FLAG),
+  )
+  const envPercentage = fallbackParsePercentage(env[FALLBACK_HEAP_PERCENTAGE_ENV])
+  const percentage = argvPercentage ?? envPercentage
+  if (percentage != null) {
+    if (availableBytes > 0) {
+      const mb = Math.max(
+        1,
+        Math.floor((availableBytes * (percentage / 100)) / (1024 * 1024)),
+      )
+      return {
+        mb,
+        source: argvPercentage != null ? 'argv-percentage' : 'env-percentage',
+        percentage,
+      }
+    }
+    return {
+      mb: FALLBACK_DEFAULT_HEAP_SIZE_MB,
+      source: 'percentage-unavailable',
+      percentage,
+    }
+  }
+  const envMb = fallbackParsePositiveIntegerMb(env[FALLBACK_HEAP_SIZE_ENV])
+  if (envMb != null) return { mb: envMb, source: 'env-mb' }
+  return { mb: FALLBACK_DEFAULT_HEAP_SIZE_MB, source: 'default' }
+}
+
+function fallbackFormatPercentageUnavailableStderr(
+  percentage,
+  fallbackMb = FALLBACK_DEFAULT_HEAP_SIZE_MB,
+) {
+  return `openclaude: could not convert heap percentage ${percentage} to megabytes because available memory is unknown; using ${fallbackMb}`
+}
+
+function fallbackEnableNodeCompileCacheIfAvailable() {
+  // Mirrors bin/node-compile-cache.mjs without the sibling file so a missing
+  // helper still warms the compile cache instead of losing the optimization.
+  const enable = nodeModule.enableCompileCache
+  if (typeof enable !== 'function') return
+  try {
+    enable()
+  } catch {
+    // Compile caching is optional and must never block startup.
+  }
+}
+
+async function loadSiblingModule(specifier) {
+  try {
+    return await import(new URL(specifier, import.meta.url).href)
+  } catch {
+    // Any load failure (missing file, unreadable, corrupt) falls back to the
+    // inline implementations above: booting the CLI outranks surfacing a
+    // packaging defect, and the fallback keeps stderr silent.
+    return null
+  }
+}
+
+const compileCacheModule = await loadSiblingModule('./node-compile-cache.mjs')
+const heapLimitModule = await loadSiblingModule('./heap-limit.mjs')
+
+const enableNodeCompileCacheIfAvailable =
+  compileCacheModule?.enableNodeCompileCacheIfAvailable ??
+  fallbackEnableNodeCompileCacheIfAvailable
+const HEAP_SIZE_ENV =
+  heapLimitModule?.HEAP_SIZE_ENV ?? FALLBACK_HEAP_SIZE_ENV
+const HEAP_SIZE_FLAG =
+  heapLimitModule?.HEAP_SIZE_FLAG ?? FALLBACK_HEAP_SIZE_FLAG
+const formatPercentageUnavailableStderr =
+  heapLimitModule?.formatPercentageUnavailableStderr ??
+  fallbackFormatPercentageUnavailableStderr
+const hasHeapLimitFlag =
+  heapLimitModule?.hasHeapLimitFlag ?? fallbackHasHeapLimitFlag
+const hasNodeFlag = heapLimitModule?.hasNodeFlag ?? fallbackHasNodeFlag
+const nodeOptionArgs =
+  heapLimitModule?.nodeOptionArgs ?? fallbackNodeOptionArgs
+const resolveHeapSizeMb =
+  heapLimitModule?.resolveHeapSizeMb ?? fallbackResolveHeapSizeMb
+const stripLauncherHeapArgs =
+  heapLimitModule?.stripLauncherHeapArgs ?? fallbackStripLauncherHeapArgs
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const distPath = join(__dirname, '..', 'dist', 'cli.mjs')
+
+const HEAP_RELAUNCHED_ENV = 'OPENCLAUDE_HEAP_RELAUNCHED'
+const DISABLE_HEAP_RELAUNCH_ENV = 'OPENCLAUDE_DISABLE_HEAP_RELAUNCH'
+
+function currentNodeOptionArgs() {
+  return [...process.execArgv, ...nodeOptionArgs(process.env.NODE_OPTIONS)]
+}
+
+function applyResolvedHeapEnv(resolved) {
+  process.env[HEAP_SIZE_ENV] = String(resolved.mb)
+  if (resolved.setMaxMemoryEnv) {
+    process.env.OPENCLAUDE_MAX_MEMORY_MB = String(resolved.mb)
+  }
+}
+
+function replaceProcessArgvWithStrippedLauncherArgs() {
+  process.argv = [
+    process.argv[0],
+    process.argv[1],
+    ...stripLauncherHeapArgs(process.argv.slice(2)),
+  ]
+}
+
+function relaunchWithLongSessionHeapIfNeeded() {
+  if (process.env[DISABLE_HEAP_RELAUNCH_ENV] === '1') {
+    replaceProcessArgvWithStrippedLauncherArgs()
+    return
+  }
+  if (process.env[HEAP_RELAUNCHED_ENV] === '1') {
+    replaceProcessArgvWithStrippedLauncherArgs()
+    return
+  }
+  const nodeArgs = currentNodeOptionArgs()
+  const hasHeapLimit = hasHeapLimitFlag(nodeArgs)
+  const hasExplicitGc = hasNodeFlag(nodeArgs, '--expose-gc')
+  if (hasHeapLimit && hasExplicitGc) {
+    replaceProcessArgvWithStrippedLauncherArgs()
+    return
+  }
+
+  const execArgv = [...process.execArgv]
+  if (!hasHeapLimit) {
+    const resolved = resolveHeapSizeMb({
+      argv: process.argv.slice(2),
+      env: process.env,
+    })
+    if (resolved.source === 'percentage-unavailable') {
+      console.error(formatPercentageUnavailableStderr(resolved.percentage))
+    }
+    applyResolvedHeapEnv(resolved)
+    execArgv.push(`${HEAP_SIZE_FLAG}=${resolved.mb}`)
+  }
+
+  // Expose explicit GC for long interactive sessions. NODE_OPTIONS cannot
+  // carry --expose-gc, so the executable wrapper must add it before startup.
+  if (!hasExplicitGc) {
+    execArgv.push('--expose-gc')
+  }
+
+  // Strip launcher-only heap args before relaunching — Commander in the built
+  // CLI would reject them as unknown. The native Node percentage flag in
+  // execArgv/NODE_OPTIONS is left untouched because this process already
+  // started with a Node that accepted it.
+  const childArgs = stripLauncherHeapArgs(process.argv.slice(2))
+
+  // Preserve the original argv[1] (which may be a symlink like
+  // /usr/local/bin/openclaude) instead of resolving it via import.meta.url.
+  // Resolving symlinks here defeats install-type detection downstream: a real
+  // npm global install (symlink → node_modules/@twigpine/openclaude/bin) would
+  // resolve to the package's real path inside node_modules, which is fine, but
+  // a `npm install -g .` dev symlink resolves back to the repo and looks like
+  // a source-tree dev run. Using argv[1] keeps the invocation path stable so
+  // doctorDiagnostic's npm-global path markers can match correctly.
+  const launcherPath = process.argv[1] || fileURLToPath(import.meta.url)
+
+  const result = spawnSync(process.execPath, [
+    ...execArgv,
+    launcherPath,
+    ...childArgs,
+  ], {
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      [HEAP_RELAUNCHED_ENV]: '1',
+    },
+  })
+
+  if (result.error) {
+    console.error(`openclaude: failed to restart with long-session heap: ${result.error.message}`)
+    process.exit(1)
+  }
+
+  process.exit(result.status ?? 1)
+}
+
+if (existsSync(distPath)) {
+  relaunchWithLongSessionHeapIfNeeded()
+  enableNodeCompileCacheIfAvailable()
+  await import(pathToFileURL(distPath).href)
+} else {
+  console.error(`
+  openclaude: dist/cli.mjs not found.
+
+  Build first:
+    bun run build
+
+  Or run directly with Bun:
+    bun run dev
+
+  See README.md for setup instructions.
+`)
+  process.exit(1)
+}

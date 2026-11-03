@@ -1,0 +1,22 @@
+{
+  "name": "openclaude-web",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro check && astro build && bun scripts/verify-dist.ts",
+    "preview": "astro preview",
+    "typecheck": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/check": "0.9.12",
+    "@astrojs/sitemap": "3.7.4",
+    "@fontsource-variable/geist-mono": "5.3.0",
+    "astro": "7.4.2",
+    "typescript": "6.0.3"
+  },
+  "overrides": {
+    "zod": "4.6.7"
+  }
+}
