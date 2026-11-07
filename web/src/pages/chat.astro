@@ -1,0 +1,112 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro'
+---
+
+<BaseLayout
+  title="Chat with AI · openclaude"
+  description="Chat with an AI assistant powered by NVIDIA NIM."
+>
+  <section class="chat-page container" aria-labelledby="chat-heading">
+    <header class="chat-heading">
+      <p class="eyebrow">// ai assistant</p>
+      <h1 id="chat-heading">ask away.</h1>
+      <p class="lede">A chat demo powered by NVIDIA NIM. This is an AI chat, not the OpenClaude coding agent.</p>
+    </header>
+
+    <div class="chat-panel">
+      <div class="messages" id="messages" role="log" aria-live="polite" aria-relevant="additions text">
+        <p class="welcome">Hello! What can I help you with?</p>
+      </div>
+      <p class="error" id="error" role="alert" hidden></p>
+      <form class="chat-form" id="chat-form">
+        <label class="visually-hidden" for="chat-input">Your message</label>
+        <textarea id="chat-input" name="message" placeholder="Type a message…" maxlength="4000" rows="2" required></textarea>
+        <button class="button button-solid" id="send-button" type="submit">Send</button>
+      </form>
+      <p class="disclaimer">AI responses may be inaccurate. Do not send sensitive information.</p>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .chat-page { min-height: calc(100vh - var(--nav-h)); padding-top: calc(var(--nav-h) + 3rem); padding-bottom: 4rem; }
+  .chat-heading { max-width: 46rem; margin: 0 auto 1.5rem; }
+  .chat-heading h1 { margin: 0 0 0.6rem; font-size: clamp(2rem, 5vw, 3rem); line-height: 1.1; }
+  .lede { color: var(--muted); }
+  .chat-panel { max-width: 46rem; min-height: 55vh; margin: 0 auto; display: flex; flex-direction: column; border: 1px solid var(--line-strong); background: var(--card-bg); }
+  .messages { min-height: 40vh; max-height: 60vh; flex: 1; overflow-y: auto; padding: 1.25rem; }
+  .welcome { color: var(--muted); }
+  .message { width: fit-content; max-width: min(85%, 40rem); margin: 0 0 1rem; padding: 0.75rem 0.9rem; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .message.user { margin-left: auto; border-color: var(--accent-line); background: var(--accent-soft); }
+  .message.assistant { background: var(--tile-bg); }
+  .chat-form { display: flex; align-items: end; gap: 0.75rem; padding: 1rem; border-top: 1px solid var(--line); }
+  textarea { flex: 1; min-width: 0; resize: vertical; padding: 0.75rem; border: 1px solid var(--line-strong); border-radius: 0; background: var(--background); color: var(--ink); font: inherit; }
+  textarea:focus { outline: 1px solid var(--accent); }
+  .button:disabled { opacity: 0.55; cursor: wait; }
+  .error { margin: 0; padding: 0 1rem 0.75rem; color: var(--red); }
+  .disclaimer { margin: 0; padding: 0 1rem 1rem; color: var(--faint); font-size: 0.7rem; }
+  @media (max-width: 480px) { .chat-form { align-items: stretch; flex-direction: column; } .chat-form button { align-self: flex-end; } }
+</style>
+
+<script>
+  type Message = { role: 'user' | 'assistant'; content: string }
+
+  const form = document.querySelector<HTMLFormElement>('#chat-form')
+  const input = document.querySelector<HTMLTextAreaElement>('#chat-input')
+  const messagesElement = document.querySelector<HTMLDivElement>('#messages')
+  const sendButton = document.querySelector<HTMLButtonElement>('#send-button')
+  const errorElement = document.querySelector<HTMLParagraphElement>('#error')
+  const conversation: Message[] = []
+
+  form?.addEventListener('submit', async event => {
+    event.preventDefault()
+    const text = input?.value.trim()
+    if (!text || !input || !messagesElement || !sendButton || !errorElement) return
+
+    const welcome = messagesElement.querySelector('.welcome')
+    welcome?.remove()
+    conversation.push({ role: 'user', content: text })
+    appendMessage('user', text)
+    input.value = ''
+    input.disabled = true
+    sendButton.disabled = true
+    sendButton.textContent = 'Thinking…'
+    errorElement.hidden = true
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: conversation.slice(-20) }),
+      })
+      const result: unknown = await response.json()
+      if (!response.ok || !result || typeof result !== 'object' || !('reply' in result) || typeof result.reply !== 'string') {
+        const message = result && typeof result === 'object' && 'error' in result && typeof result.error === 'string'
+          ? result.error
+          : 'Chat request failed. Please try again.'
+        throw new Error(message)
+      }
+      conversation.push({ role: 'assistant', content: result.reply })
+      appendMessage('assistant', result.reply)
+    } catch (error) {
+      // Remove the failed user turn so a retry doesn't duplicate it in history.
+      conversation.pop()
+      errorElement.textContent = error instanceof Error ? error.message : 'Chat request failed.'
+      errorElement.hidden = false
+    } finally {
+      input.disabled = false
+      sendButton.disabled = false
+      sendButton.textContent = 'Send'
+      input.focus()
+    }
+  })
+
+  function appendMessage(role: Message['role'], content: string) {
+    if (!messagesElement) return
+    const bubble = document.createElement('p')
+    bubble.className = `message ${role}`
+    bubble.textContent = content
+    messagesElement.append(bubble)
+    messagesElement.scrollTop = messagesElement.scrollHeight
+  }
+</script>
